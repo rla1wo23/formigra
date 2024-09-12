@@ -1,0 +1,15 @@
+# 환경 설정 파일 무시
+.env
+
+# 사용자별 파일 무시
+.bash_history
+.mysql_history
+.viminfo
+.bash_logout
+.bash_profile
+.bashrc
+
+# NPM 및 Node.js 관련 디렉토리 무시
+.npm/
+.nvm/
+node_modules/
