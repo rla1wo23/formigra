@@ -71,14 +71,14 @@ app.get("/api/seats/:screenId", async (req, res) => {
   const { screenId } = req.params;
   try {
     // Redis에서 좌석 정보 조회
-    let seats = await redisClient.get(`seats:${screenId}`);
+    const seats = await redisClient.getAsync(`seats:${screenId}`);
 
     if (seats) {
       // Redis에서 좌석 정보가 있는 경우
       console.log(`Seats for screen ${screenId} found in Redis.`);
       return res.status(200).json(JSON.parse(seats));
     } else {
-      // Redis에 좌석 정보가 없는 경우
+      // Redis에 좌석 정보가 없는 경우, RDS에서 조회
       console.log(
         `Seats for screen ${screenId} not found in Redis. Fetching from RDS...`,
       );
@@ -93,10 +93,13 @@ app.get("/api/seats/:screenId", async (req, res) => {
           .json({ error: "No seats found for this screen." });
       }
 
-      // 좌석정보 캐싱
-      await redisClient.set(`seats:${screenId}`, JSON.stringify(rows), {
-        EX: 60 * 5, // 5분 TTL
-      });
+      // 조회된 좌석 정보를 Redis에 캐싱 (5분 TTL)
+      await redisClient.setAsync(
+        `seats:${screenId}`,
+        JSON.stringify(rows),
+        "EX",
+        60 * 5,
+      );
 
       console.log(`Seats for screen ${screenId} cached in Redis.`);
       return res.status(200).json(rows);
@@ -109,12 +112,37 @@ app.get("/api/seats/:screenId", async (req, res) => {
 
 // 좌석 예약 API
 app.post("/api/seats/reserve", async (req, res) => {
-  const { screenId, seatId } = req.body; // 요청 본문에서 screenId와 seatId 값을 가져옴
-  try {
-    //REDIS 좌석 조회
-    let seatStatus = await redisClient.get(`seat:${screenId}:${seatId}`);
+  const { screenId, seatId, userId } = req.body; // 요청 본문에서 screenId, seatId, userId를 가져옴
 
-    if (seatStatus === null) {
+  if (!screenId || !seatId || !userId) {
+    return res
+      .status(400)
+      .json({ error: "screenId, seatId, and userId are required" });
+  }
+
+  const lockKey = `lock:seat:${screenId}:${seatId}`;
+  const seatKey = `seat:${screenId}:${seatId}`;
+
+  try {
+    // 1. 좌석 잠금 (lock) 설정
+    const isLocked = await redisClient.setAsync(
+      lockKey,
+      "locked",
+      "NX",
+      "EX",
+      30,
+    ); // 30초 TTL
+
+    if (!isLocked) {
+      return res
+        .status(423)
+        .json({ error: "Seat is currently being reserved by another user" });
+    }
+
+    // 2. Redis에서 좌석 상태 조회
+    let seatStatus = await redisClient.getAsync(seatKey);
+
+    if (!seatStatus) {
       // Redis에 좌석 정보가 없으면 RDS에서 조회
       console.log(
         `Seat ${seatId} for screen ${screenId} not found in Redis. Fetching from RDS...`,
@@ -125,32 +153,37 @@ app.post("/api/seats/reserve", async (req, res) => {
       );
 
       if (rows.length === 0) {
+        await redisClient.delAsync(lockKey); // 잠금 해제
         return res.status(404).json({ error: "Seat not found" });
       }
+
       seatStatus = rows[0].Status;
 
-      // 좌석 캐싱
-      await redisClient.set(`seat:${screenId}:${seatId}`, seatStatus, {
-        EX: 60 * 5, // 5분 TTL
-      });
-
+      // 좌석 정보 Redis에 캐싱 (5분 TTL)
+      await redisClient.setAsync(seatKey, seatStatus, "EX", 60 * 5);
       console.log(`Seat ${seatId} for screen ${screenId} cached in Redis.`);
     }
-    // 좌석 예약 여부 확인
+
+    // 3. 좌석 예약 여부 확인
     if (seatStatus === "reserved") {
+      await redisClient.delAsync(lockKey); // 잠금 해제
       return res.status(400).json({ error: "Seat already reserved" });
     }
 
-    // 동기화
-    await redisClient.set(`seat:${screenId}:${seatId}`, "reserved"); // Redis
+    // 4. 좌석 예약 처리 (Redis와 RDS 동기화)
+    await redisClient.setAsync(seatKey, "reserved"); // Redis에서 상태 업데이트
     await pool.query(
       'UPDATE Seats SET Status = "reserved" WHERE ScreenID = ? AND SeatID = ?',
       [screenId, seatId],
     );
-    //RDS
+
+    // 5. 잠금 해제
+    await redisClient.delAsync(lockKey);
+
     res.status(200).json({ message: "Seat reserved successfully" });
   } catch (error) {
     console.error("Error reserving seat:", error);
+    await redisClient.delAsync(lockKey); // 오류 발생 시 잠금 해제
     res.status(500).json({ error: "Server error" });
   }
 });
